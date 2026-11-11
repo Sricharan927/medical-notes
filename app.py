@@ -51,10 +51,14 @@ Use empty strings for fields that are not present."""
 @st.cache_resource
 def get_gemini():
     try:
-        from google import genai
-        return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+        key = st.secrets["GEMINI_API_KEY"]
     except Exception:
-        return None
+        return None, "GEMINI_API_KEY was not found in Streamlit Secrets"
+    try:
+        from google import genai
+        return genai.Client(api_key=key), ""
+    except Exception as e:
+        return None, f"could not load the google-genai library: {e}"
 
 
 def gemini_models():
@@ -166,9 +170,9 @@ def run_local(pil_image, multi):
 def extract(pil_image, use_gemini, multi):
     note = ""
     if use_gemini:
-        client = get_gemini()
+        client, err = get_gemini()
         if client is None:
-            note = "No Gemini API key set, so the local OCR was used."
+            note = f"Gemini is not available ({err}), so the local OCR was used."
         else:
             try:
                 return run_gemini(client, pil_image) | {"note": ""}
@@ -177,7 +181,7 @@ def extract(pil_image, use_gemini, multi):
                 if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                     note = "Gemini free limit reached, so the local OCR was used instead."
                 else:
-                    note = "Gemini was unavailable, so the local OCR was used instead."
+                    note = f"Gemini failed, so the local OCR was used instead. Reason: {msg[:400]}"
     try:
         return run_local(pil_image, multi) | {"note": note}
     except Exception as e:
