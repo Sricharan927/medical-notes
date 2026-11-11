@@ -1,0 +1,10 @@
+streamlit
+google-genai
+easyocr
+opencv-python-headless
+rapidfuzz
+pandas
+pillow
+numpy
+torch
+torchvision
