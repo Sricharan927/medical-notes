@@ -3,6 +3,7 @@ google-genai
 easyocr
 opencv-python-headless
 rapidfuzz
+openpyxl
 pandas
 pillow
 numpy

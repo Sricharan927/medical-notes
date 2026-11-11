@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import time
 
 import cv2
 import numpy as np
@@ -13,6 +14,9 @@ from PIL import Image, ImageDraw, ImageOps
 from rapidfuzz import fuzz, process
 
 st.set_page_config(page_title="Handwritten Medical Notes OCR", page_icon="📝")
+
+MAX_FILES = 10          # per batch
+GEMINI_GAP_SECONDS = 4  # pause between Gemini calls to respect free-tier rate limits
 
 # Gemini model names are tried in order (Google renames models often).
 # Override the first choice with GEMINI_MODEL in Streamlit Secrets if needed.
@@ -35,34 +39,45 @@ Rules:
 - Keep the original line breaks in full_text (use \\n).
 - Keep abbreviations (BD, TDS, OD, SOS, tab, cap, etc.) as written in full_text,
   and put the plain-English meaning only in the medicines list.
-
+<<LANG_RULE>>
 Return ONLY valid JSON in this shape:
 {
   "full_text": "",
   "patient": "",
   "doctor": "",
   "date": "",
-  "diagnosis_or_notes": "",
+  "diagnosis_or_notes": "",<<TRANSLATION_FIELD>>
   "medicines": [
     {"name": "", "dose": "", "frequency": "", "duration": "", "remarks": "", "confidence": "high|medium|low"}
   ]
 }
 Use empty strings for fields that are not present."""
 
+LANG_RULE = (
+    "- The note may contain English, Kannada, Telugu, Hindi or other Indian languages. Transcribe non-English "
+    "text in its original script in full_text, and put an English translation of ONLY the non-English parts "
+    "in translation_en (use an empty string if everything is English)."
+)
+
 # Values that must be checked by a human before download
 RISK = re.compile(
-    r"(?<![\d/])\d{2,3}\s*/\s*\d{2,3}(?![\d/])"                                   # blood pressure like 110/70
+    r"(?<![\d/])\d{2,3}\s*/\s*\d{2,3}(?![\d/])"                                        # blood pressure like 110/70
     r"|\d+(?:\.\d+)?\s*(?:mg/dl|mmol/l|mmhg|mcg|mg|ug|ml|iu|units?|sachets?|bpm|g|%)"  # doses / readings
-    r"|\S*\[\?\]|\[illegible\]",                                                  # uncertain words
+    r"|\S*\[\?\]|\[illegible\]",                                                       # uncertain words
     re.IGNORECASE,
 )
 
 PRIVATE_LABELS = ["name", "uhid", "patient", "mrn", "phone", "mobile", "address", "regno", "ipno"]
 
 
-# ---------------- Password gate ----------------
+def build_prompt(translate):
+    p = PROMPT.replace("<<LANG_RULE>>", LANG_RULE if translate else "")
+    return p.replace("<<TRANSLATION_FIELD>>", '\n  "translation_en": "",' if translate else "")
+
+
+# ---------------- Password gate (optional) ----------------
 def password_gate():
-    """Returns True if the app has a password set. Stops the script until it is entered."""
+    """Returns True if a password is configured. Stops the script until it is entered."""
     try:
         pw = str(st.secrets["APP_PASSWORD"])
     except Exception:
@@ -103,7 +118,7 @@ def gemini_models():
     return models
 
 
-def run_gemini(client, pil_image):
+def run_gemini(client, pil_image, translate):
     from google.genai import types
 
     img = pil_image.convert("RGB")
@@ -111,13 +126,14 @@ def run_gemini(client, pil_image):
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=92)
     jpeg = buf.getvalue()
+    prompt = build_prompt(translate)
 
     last_error = None
     for model in gemini_models():
         try:
             resp = client.models.generate_content(
                 model=model,
-                contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), PROMPT],
+                contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt],
                 config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
             )
             raw = (resp.text or "").strip()
@@ -130,7 +146,10 @@ def run_gemini(client, pil_image):
                 "engine": f"Gemini AI ({model})",
                 "text": data.get("full_text", ""),
                 "medicines": data.get("medicines") or [],
-                "details": {k: data.get(k, "") for k in ("patient", "doctor", "date", "diagnosis_or_notes")},
+                "details": {
+                    k: data.get(k, "")
+                    for k in ("patient", "doctor", "date", "diagnosis_or_notes", "translation_en")
+                },
                 "words": [],
             }
         except Exception as e:
@@ -193,14 +212,14 @@ def run_local(pil_image, multi):
         "engine": f"Local OCR ({variant})",
         "text": group_lines(res),
         "medicines": [],
-        "details": {"patient": "", "doctor": "", "date": "", "diagnosis_or_notes": ""},
+        "details": {"patient": "", "doctor": "", "date": "", "diagnosis_or_notes": "", "translation_en": ""},
         "words": [(t, round(float(c), 2)) for _, t, c in res],
     }
 
 
 # ---------------- Privacy: black out patient details BEFORE anything is sent ----------------
 def redact(pil_image, auto, bands):
-    """Black out Name/UHID/etc. lines (found locally) and any manual bands. Returns (image, labels_found)."""
+    """Black out Name/UHID/etc. lines (found locally) and manual bands. Returns (jpeg_bytes, labels_found)."""
     img = ImageOps.exif_transpose(pil_image).convert("RGB")
     W, H = img.size
     found = 0
@@ -220,11 +239,14 @@ def redact(pil_image, auto, bands):
     for lo, hi in bands:
         if hi > lo:
             draw.rectangle([0, H * lo / 100, W, H * hi / 100], fill="black")
-    return img, found
+    img.thumbnail((2000, 2000))  # keep memory small: store compressed bytes, not big images
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue(), found
 
 
 # ---------------- Smart pipeline ----------------
-def extract(pil_image, use_gemini, multi):
+def extract(pil_image, use_gemini, multi, translate):
     note = ""
     if use_gemini:
         client, err = get_gemini()
@@ -232,7 +254,7 @@ def extract(pil_image, use_gemini, multi):
             note = f"Gemini is not available ({err}), so the local OCR was used."
         else:
             try:
-                return run_gemini(client, pil_image) | {"note": ""}
+                return run_gemini(client, pil_image, translate) | {"note": ""}
             except Exception as e:
                 msg = str(e)
                 if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
@@ -276,19 +298,122 @@ def apply_replacements(text, pairs):
     return text
 
 
+def to_excel_bytes(df):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Notes")
+    return buf.getvalue()
+
+
+def render_result(filename, file_id, result):
+    """Shows one note's result. Returns (csv_row_dict, all_values_verified)."""
+    if result["note"]:
+        st.info(result["note"])
+    st.caption(f"Engine used: {result['engine']}")
+
+    st.markdown("**📝 Extracted text**")
+    st.caption("[?] marks uncertain words and [illegible] marks unreadable ones.")
+    st.text(result["text"] or "(nothing detected)")
+
+    drugs = load_drugs()
+    pairs = []
+    rows = suggest_drugs(result["text"], drugs) if drugs else []
+    if rows:
+        st.markdown("**💊 Possible medicine-name corrections**")
+        st.caption("Tick only the ones that are right. Add more names to drugs.txt to improve this.")
+        edited = st.data_editor(
+            pd.DataFrame(rows),
+            hide_index=True,
+            use_container_width=True,
+            disabled=["Written", "Suggested drug", "Match %"],
+            key=f"sugg_{file_id}",
+        )
+        pairs = [(r["Written"], r["Suggested drug"]) for _, r in edited.iterrows() if r["Apply"]]
+
+    st.markdown("**✏️ Final text (editable)**")
+    final_text = st.text_area(
+        "Final text",
+        value=apply_replacements(result["text"], pairs),
+        height=220,
+        key=f"final_{file_id}_{hash(tuple(pairs))}",
+        label_visibility="collapsed",
+    )
+
+    details = result["details"]
+    if details.get("translation_en"):
+        st.markdown("**🌐 English translation of non-English text**")
+        st.write(details["translation_en"])
+
+    meds = result["medicines"]
+    if meds:
+        st.markdown("**💊 Medicines detected**")
+        st.dataframe(pd.DataFrame(meds), hide_index=True, use_container_width=True)
+
+    others = {k: v for k, v in details.items() if v and k not in ("translation_en", "patient")}
+    if others:
+        st.markdown("**🗂️ Other details**")
+        for k, v in others.items():
+            st.write(f"**{k.replace('_', ' ').title()}:** {v}")
+
+    found_abbr = []
+    for tok in re.findall(r"[A-Za-z]+", final_text):
+        if tok.upper() in ABBREVIATIONS and tok.upper() not in [f["Abbreviation"] for f in found_abbr]:
+            found_abbr.append({"Abbreviation": tok.upper(), "Meaning": ABBREVIATIONS[tok.upper()]})
+    if found_abbr:
+        st.markdown("**📖 Abbreviations found**")
+        st.dataframe(pd.DataFrame(found_abbr), hide_index=True, use_container_width=True)
+
+    low = [(w, c) for w, c in result["words"] if c < 0.5]
+    if low:
+        with st.expander(f"⚠️ {len(low)} low-confidence words (check these carefully)"):
+            st.dataframe(pd.DataFrame(low, columns=["Word", "Confidence"]), hide_index=True)
+
+    risky = []
+    for m in RISK.finditer(final_text):
+        tok = re.sub(r"\s+", " ", m.group(0)).strip()
+        if tok not in risky:
+            risky.append(tok)
+
+    all_verified = True
+    if risky:
+        st.markdown("**✅ Verify before download**")
+        st.caption("Compare each value with the original note, then tick it.")
+        for tok in risky:
+            key = f"ver_{hashlib.md5((file_id + tok).encode()).hexdigest()[:12]}"
+            if not st.checkbox(tok, key=key):
+                all_verified = False
+
+    row = {
+        "Image": filename,
+        "Extracted Text": final_text,
+        "English translation": details.get("translation_en", ""),
+        "Date": details.get("date", ""),
+        "Doctor": details.get("doctor", ""),
+        "Medicines": "; ".join(
+            " ".join(filter(None, [m.get("name"), m.get("dose"), m.get("frequency"), m.get("duration")]))
+            for m in meds
+        ),
+        "Engine": result["engine"],
+        "Values verified": "yes" if all_verified else "no",
+    }
+    return row, all_verified
+
+
 # ---------------- UI ----------------
 st.title("📝 Handwritten Medical Notes OCR")
 has_password = password_gate()
 
-st.write("Upload an image of a handwritten prescription, and we'll extract the text for you.")
+st.write("Upload images of handwritten prescriptions or notes, and we'll extract the text for you.")
 
-if "uploader_key" not in st.session_state:
-    st.session_state.uploader_key = 0
+for k, default in (("uploader_key", 0), ("red", {}), ("results", {})):
+    if k not in st.session_state:
+        st.session_state[k] = default
 
 with st.expander("⚙️ Settings", expanded=False):
     use_gemini = st.checkbox(
         "Use Gemini AI first (more accurate, but the image is sent to Google)", value=True
     )
+    translate = st.checkbox("Read Kannada / Telugu / Hindi text and add an English translation", value=True)
     multi = st.checkbox("Local OCR: try image enhancements (slower, better)", value=True)
     auto_hide = st.checkbox("Automatically black out Name / UHID / patient ID lines before processing", value=True)
     st.caption("Manual blackout bands (% of image height, top to bottom). Use these for anything private the auto-hide misses.")
@@ -301,153 +426,114 @@ with st.expander("⚙️ Settings", expanded=False):
     if not has_password:
         st.warning("🔓 No APP_PASSWORD secret is set, so anyone with the link can use this app and your free quota.")
 
-uploaded = st.file_uploader(
-    "Upload an image (JPG/PNG)",
+files = st.file_uploader(
+    f"Upload images (JPG/PNG, up to {MAX_FILES} at a time)",
     type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True,
     key=f"uploader_{st.session_state.uploader_key}",
 )
 
-if uploaded:
+if files:
+    if len(files) > MAX_FILES:
+        st.warning(f"Only the first {MAX_FILES} images will be used.")
+        files = files[:MAX_FILES]
+
     bands = (band1, band2)
-    red_key = f"{uploaded.name}-{uploaded.size}-{auto_hide}-{bands}"
-    file_id = f"{red_key}-{use_gemini}-{multi}"
+    entries = []  # (uploaded_file, red_key, file_id)
 
-    # Step 1: redact locally and show exactly what would be sent
-    if st.session_state.get("red_key") != red_key:
-        with st.spinner("Hiding patient details... ⏳"):
-            try:
-                img, found = redact(Image.open(uploaded), auto_hide, bands)
-            except Exception as e:
-                st.error(f"Could not prepare the image: {e}")
-                st.stop()
-        st.session_state.red_img, st.session_state.red_found = img, found
-        st.session_state.red_key = red_key
+    # Step 1: redact each image locally and show exactly what would be sent
+    for f in files:
+        red_key = f"{f.name}-{f.size}-{auto_hide}-{bands}"
+        file_id = f"{red_key}-{use_gemini}-{multi}-{translate}"
+        if red_key not in st.session_state.red:
+            with st.spinner(f"Hiding patient details in {f.name}... ⏳"):
+                try:
+                    st.session_state.red[red_key] = redact(Image.open(f), auto_hide, bands)
+                except Exception as e:
+                    st.error(f"Could not prepare {f.name}: {e}")
+                    continue
+        entries.append((f, red_key, file_id))
 
-    send_img = st.session_state.red_img
-    st.image(send_img, caption="This is the image that will be processed (black boxes are hidden)", use_container_width=True)
-    if auto_hide and st.session_state.red_found == 0:
-        st.warning("Couldn't find Name/ID labels automatically. Check the image above, and use the manual blackout bands in Settings if anything private is visible.")
-    elif auto_hide:
-        st.caption(f"Hid {st.session_state.red_found} patient-detail line(s). Check the image above before continuing.")
+    for f, red_key, _ in entries:
+        img_bytes, found = st.session_state.red[red_key]
+        with st.expander(f"👁️ Preview of what will be processed: {f.name}", expanded=len(entries) == 1):
+            st.image(img_bytes, caption="Black boxes are hidden before processing", use_container_width=True)
+            if auto_hide and found == 0:
+                st.warning("Couldn't find Name/ID labels automatically. If anything private is visible, use the manual blackout bands in Settings.")
+            elif auto_hide:
+                st.caption(f"Hid {found} patient-detail line(s). Check the image before continuing.")
 
-    # Step 2: only extract when the user clicks
-    if st.button("🔍 Extract text", type="primary"):
-        with st.spinner("Reading handwriting... ⏳"):
-            try:
-                st.session_state.result = extract(send_img, use_gemini, multi)
-            except Exception as e:
-                st.error(f"Could not read the image: {e}")
-                st.stop()
-        st.session_state.result_id = file_id
+    # Step 2: extract only when the user clicks
+    pending = [e for e in entries if e[2] not in st.session_state.results]
+    if pending:
+        label = "🔍 Extract text" if len(entries) == 1 else f"🔍 Extract text from {len(pending)} image(s)"
+        if st.button(label, type="primary"):
+            progress = st.progress(0.0)
+            status = st.empty()
+            failures = []
+            for i, (f, red_key, file_id) in enumerate(pending):
+                status.write(f"Reading {i + 1} of {len(pending)}: {f.name} ⏳")
+                try:
+                    pil = Image.open(io.BytesIO(st.session_state.red[red_key][0]))
+                    st.session_state.results[file_id] = extract(pil, use_gemini, multi, translate)
+                except Exception as e:
+                    failures.append(f"{f.name}: {e}")
+                progress.progress((i + 1) / len(pending))
+                if use_gemini and i < len(pending) - 1:
+                    time.sleep(GEMINI_GAP_SECONDS)  # stay under free-tier per-minute limits
+            status.empty()
+            progress.empty()
+            for msg in failures:
+                st.error(f"Could not read {msg}")
 
-    if st.session_state.get("result_id") == file_id:
-        result = st.session_state.result
+    # Step 3: show results
+    done = [e for e in entries if e[2] in st.session_state.results]
+    if done:
+        rows, verified_flags = [], []
+        if len(done) == 1:
+            f, _, file_id = done[0]
+            row, ok = render_result(f.name, file_id, st.session_state.results[file_id])
+            rows.append(row)
+            verified_flags.append(ok)
+        else:
+            tabs = st.tabs([f"{i + 1}. {e[0].name[:18]}" for i, e in enumerate(done)])
+            for tab, (f, _, file_id) in zip(tabs, done):
+                with tab:
+                    row, ok = render_result(f.name, file_id, st.session_state.results[file_id])
+                    rows.append(row)
+                    verified_flags.append(ok)
 
-        if result["note"]:
-            st.info(result["note"])
-        st.caption(f"Engine used: {result['engine']}")
-
-        st.subheader("📝 Extracted Text")
-        st.caption("[?] marks uncertain words and [illegible] marks unreadable ones.")
-        st.text(result["text"] or "(nothing detected)")
-
-        drugs = load_drugs()
-        pairs = []
-        rows = suggest_drugs(result["text"], drugs) if drugs else []
-        if rows:
-            st.subheader("💊 Possible medicine-name corrections")
-            st.caption("Tick only the ones that are right. Add more names to drugs.txt to improve this.")
-            edited = st.data_editor(
-                pd.DataFrame(rows),
-                hide_index=True,
-                use_container_width=True,
-                disabled=["Written", "Suggested drug", "Match %"],
-                key=f"sugg_{file_id}",
-            )
-            pairs = [(r["Written"], r["Suggested drug"]) for _, r in edited.iterrows() if r["Apply"]]
-
-        st.subheader("✏️ Final text (editable)")
-        final_text = st.text_area(
-            "Final text",
-            value=apply_replacements(result["text"], pairs),
-            height=220,
-            key=f"final_{file_id}_{hash(tuple(pairs))}",
-            label_visibility="collapsed",
-        )
-
-        meds = result["medicines"]
-        if meds:
-            st.subheader("💊 Medicines detected")
-            st.dataframe(pd.DataFrame(meds), hide_index=True, use_container_width=True)
-
-        details = result["details"]
-        if any(details.values()):
-            st.subheader("🗂️ Other details")
-            for k, v in details.items():
-                if v:
-                    st.write(f"**{k.replace('_', ' ').title()}:** {v}")
-
-        found_abbr = []
-        for tok in re.findall(r"[A-Za-z]+", final_text):
-            if tok.upper() in ABBREVIATIONS and tok.upper() not in [f["Abbreviation"] for f in found_abbr]:
-                found_abbr.append({"Abbreviation": tok.upper(), "Meaning": ABBREVIATIONS[tok.upper()]})
-        if found_abbr:
-            st.subheader("📖 Abbreviations found")
-            st.dataframe(pd.DataFrame(found_abbr), hide_index=True, use_container_width=True)
-
-        low = [(w, c) for w, c in result["words"] if c < 0.5]
-        if low:
-            with st.expander(f"⚠️ {len(low)} low-confidence words (check these carefully)"):
-                st.dataframe(pd.DataFrame(low, columns=["Word", "Confidence"]), hide_index=True)
-
-        # Verification of risky values
-        risky = []
-        for m in RISK.finditer(final_text):
-            tok = re.sub(r"\s+", " ", m.group(0)).strip()
-            if tok not in risky:
-                risky.append(tok)
-
-        all_verified = True
-        if risky:
-            st.subheader("✅ Verify before download")
-            st.caption("Compare each value with the original note, then tick it. The download unlocks when all are ticked.")
-            for tok in risky:
-                key = f"ver_{hashlib.md5((file_id + tok).encode()).hexdigest()[:12]}"
-                if not st.checkbox(tok, key=key):
-                    all_verified = False
-
+        st.divider()
         st.warning("⚠️ OCR can make mistakes. Always confirm medicine names and doses with the doctor or a pharmacist.")
 
-        out = pd.DataFrame(
-            [
-                {
-                    "Image": uploaded.name,
-                    "Extracted Text": final_text,
-                    "Date": details["date"],
-                    "Doctor": details["doctor"],
-                    "Medicines": "; ".join(
-                        " ".join(filter(None, [m.get("name"), m.get("dose"), m.get("frequency"), m.get("duration")]))
-                        for m in meds
-                    ),
-                    "Engine": result["engine"],
-                    "Values verified": "yes" if all_verified else "no",
-                }
-            ]
-        )
-        col1, col2 = st.columns(2)
+        all_verified = all(verified_flags)
+        df = pd.DataFrame(rows)
+        st.subheader("📥 Download")
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.download_button(
                 "✅ Download CSV",
-                data=out.to_csv(index=False).encode("utf-8"),
+                data=df.to_csv(index=False).encode("utf-8"),
                 file_name="extracted_text.csv",
                 mime="text/csv",
                 disabled=not all_verified,
             )
-            if not all_verified:
-                st.caption("Tick every value above to enable the download.")
         with col2:
+            try:
+                st.download_button(
+                    "📊 Download Excel",
+                    data=to_excel_bytes(df),
+                    file_name="extracted_text.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    disabled=not all_verified,
+                )
+            except Exception:
+                st.caption("Excel export unavailable (openpyxl missing).")
+        with col3:
             if st.button("❌ Start Over"):
                 st.session_state.uploader_key += 1
-                for k in ("result", "result_id", "red_key", "red_img", "red_found"):
-                    st.session_state.pop(k, None)
+                st.session_state.red = {}
+                st.session_state.results = {}
                 st.rerun()
+        if not all_verified:
+            st.caption("Tick every value in every note to enable the downloads.")
